@@ -29,7 +29,9 @@ class JiraClient:
     def fetch_issues(self):
         issues = []
         start_at = 0
+        print("Fetching issues from JIRA...")
         while True:
+            print(f"Requesting issues {start_at} to {start_at + self.max_results}...")
             params = {
                 'jql': self.config.jira_query,
                 'startAt': start_at,
@@ -44,6 +46,7 @@ class JiraClient:
             if start_at + self.max_results >= data['total']:
                 break
             start_at += self.max_results
+        print(f"Total issues fetched: {len(issues)}")
         return issues
 
 class GitRepoAnalyzer:
@@ -53,16 +56,19 @@ class GitRepoAnalyzer:
 
     def _open_or_clone_repo(self):
         if os.path.exists(self.config.local_repo_path):
+            print(f"Using existing local repo at {self.config.local_repo_path}")
             return Repo(self.config.local_repo_path)
         print(f"Cloning repository for {self.config.name}...")
         return Repo.clone_from(self.config.repo_url, self.config.local_repo_path)
 
     def map_issues_to_commits(self, issues):
+        print("Mapping issues to commits...")
         issue_commit_map = {}
         for commit in self.repo.iter_commits():
             matches = re.findall(self.config.issue_key_pattern, commit.message)
             for issue_id in matches:
                 issue_commit_map.setdefault(issue_id, []).append(commit)
+        print(f"Issues with commits mapped: {len(issue_commit_map)}")
         return issue_commit_map
 
 class FeatureExtractor:
@@ -90,11 +96,19 @@ class FeatureExtractor:
         return None
 
     def extract(self):
+        print("Extracting features from issues...")
         data = []
+        skipped_no_commits = 0
+
         for issue in self.issues:
             key = issue['key']
             fields = issue['fields']
             changelog = issue.get('changelog', {})
+
+            commits = self.issue_commit_map.get(key, [])
+            if not commits:
+                skipped_no_commits += 1
+                continue  # Skip issues with no commits
 
             created = datetime.strptime(fields['created'], '%Y-%m-%dT%H:%M:%S.%f%z')
             resolved = datetime.strptime(fields['resolutiondate'], '%Y-%m-%dT%H:%M:%S.%f%z') if fields['resolutiondate'] else None
@@ -104,8 +118,10 @@ class FeatureExtractor:
             description_length = len(fields['description']) if fields['description'] else 0
             num_comments = fields['comment']['total'] if fields['comment'] else 0
 
-            commits = self.issue_commit_map.get(key, [])
-            total_lines_changed = sum(commit.stats.total['lines'] for commit in commits)
+            lines_added = sum(commit.stats.total.get('insertions', 0) for commit in commits)
+            lines_deleted = sum(commit.stats.total.get('deletions', 0) for commit in commits)
+            lines_updated = min(lines_added, lines_deleted)
+
             total_files_changed = sum(len(commit.stats.files) for commit in commits)
             num_commits = len(commits)
 
@@ -117,10 +133,15 @@ class FeatureExtractor:
                 'num_comments': num_comments,
                 'time_to_resolve_hours': time_to_resolve,
                 'time_in_progress_hours': time_in_progress,
-                'total_lines_changed': total_lines_changed,
+                'lines_added': lines_added,
+                'lines_deleted': lines_deleted,
+                'lines_updated_est': lines_updated,
                 'total_files_changed': total_files_changed,
                 'num_commits': num_commits
             })
+
+        print(f"Issues included in dataset: {len(data)}")
+        print(f"Issues skipped (no commits): {skipped_no_commits}")
         return pd.DataFrame(data)
 
 class EffortDatasetBuilder:
@@ -130,20 +151,18 @@ class EffortDatasetBuilder:
         self.repo_analyzer = GitRepoAnalyzer(config)
 
     def build_and_save(self, output_file=None):
-        print(f"\nBuilding dataset for {self.config.name}...")
+        print(f"\n--- Building dataset for {self.config.name} ---")
 
         issues = self.jira_client.fetch_issues()
-        print(f"Fetched {len(issues)} issues.")
 
         issue_commit_map = self.repo_analyzer.map_issues_to_commits(issues)
-        print(f"Mapped {len(issue_commit_map)} issues to commits.")
 
         extractor = FeatureExtractor(issues, issue_commit_map)
         dataset = extractor.extract()
 
         output_file = output_file or f"{self.config.jira_key.lower()}_effort_dataset.csv"
         dataset.to_csv(output_file, index=False)
-        print(f"Dataset saved to '{output_file}'.")
+        print(f"✅ Dataset saved to '{output_file}'.")
 
 # -------------------- Run --------------------
 
@@ -162,7 +181,8 @@ if __name__ == "__main__":
         local_repo_path="./ant-ivy"
     )
 
-    # Swap CALCITE_CONFIG with IVY_CONFIG to build for Ant-Ivy
+    # Choose config
     config = CALCITE_CONFIG
+    # config = IVY_CONFIG
     builder = EffortDatasetBuilder(config)
     builder.build_and_save()
